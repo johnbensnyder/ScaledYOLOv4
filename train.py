@@ -4,6 +4,7 @@ import os
 import random
 import time
 from pathlib import Path
+from ast import literal_eval
 
 import numpy as np
 import torch.distributed as dist
@@ -27,6 +28,11 @@ from utils.general import (
 from utils.google_utils import attempt_download
 from utils.torch_utils import init_seeds, ModelEMA, select_device, intersect_dicts
 
+import smdebug.pytorch as smd
+from smdebug.core.reduction_config import ReductionConfig
+from smdebug.core.save_config import SaveConfig
+from smdebug.core.collection import CollectionKeys
+from smdebug.core.config_constants import DEFAULT_CONFIG_FILE_PATH
 
 def train(hyp, opt, device, tb_writer=None):
     print(f'Hyperparameters {hyp}')
@@ -37,7 +43,7 @@ def train(hyp, opt, device, tb_writer=None):
     best = wdir + 'best.pt'
     results_file = str(log_dir / 'results.txt')
     epochs, batch_size, total_batch_size, weights, rank = \
-        opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank
+        opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, int(os.environ.get("RANK", -1)) # int(os.environ.get("OMPI_COMM_WORLD_RANK", -1)) #opt.global_rank
 
     # TODO: Use DDP logging. Only the first process is allowed to log.
     # Save run settings
@@ -143,7 +149,9 @@ def train(hyp, opt, device, tb_writer=None):
 
     # DDP mode
     if cuda and rank != -1:
-        model = DDP(model, device_ids=[opt.local_rank], output_device=(opt.local_rank))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", 0))
+        model = DDP(model, device_ids=[local_rank], output_device=(local_rank))
 
     # Trainloader
     dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt, hyp=hyp, augment=True,
@@ -194,6 +202,12 @@ def train(hyp, opt, device, tb_writer=None):
         print('Image sizes %g train, %g test' % (imgsz, imgsz_test))
         print('Using %g dataloader workers' % dataloader.num_workers)
         print('Starting training for %g epochs...' % epochs)
+        
+    # wrap model in debugger
+    if Path(DEFAULT_CONFIG_FILE_PATH).exists() and int(os.environ.get("RANK", 0))==0:
+    # if Path(DEFAULT_CONFIG_FILE_PATH).exists() and int(os.environ.get("OMPI_COMM_WORLD_RANK", 0))==0:
+        hook = smd.get_hook(create_if_not_exists=True)
+        hook.register_module(model)
     # torch.autograd.set_detect_anomaly(True)
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
@@ -225,7 +239,8 @@ def train(hyp, opt, device, tb_writer=None):
         pbar = enumerate(dataloader)
         if rank in [-1, 0]:
             print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
-            pbar = tqdm(pbar, total=nb)  # progress bar
+            # disable pbar for sagemaker, instead print logging to cloudwatch
+            # pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
@@ -281,7 +296,10 @@ def train(hyp, opt, device, tb_writer=None):
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
-                pbar.set_description(s)
+                # pbar.set_description(s)
+                if i%10==0:
+                    print("step {} of {}".format(i, nb))
+                    print(s)
 
                 # Plot
                 if ni < 3:
@@ -373,13 +391,13 @@ def train(hyp, opt, device, tb_writer=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='yolov4-p5.pt', help='initial weights path')
+    parser.add_argument('--weights', type=str, default='', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/coco128.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='', help='hyperparameters path, i.e. data/hyp.scratch.yaml')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
-    parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='train,test sizes')
+    parser.add_argument('--img-size', nargs='+', type=int, default=[896, 896], help='train,test sizes')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const='get_last', default=False,
                         help='resume from given path/last.pt, or most recent run if blank')
@@ -388,16 +406,21 @@ if __name__ == '__main__':
     parser.add_argument('--noautoanchor', action='store_true', help='disable autoanchor check')
     parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
-    parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
+    parser.add_argument('--cache-images', type=str, default="False", help='cache images for faster training')
     parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
-    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
-    parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
-    parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
+    parser.add_argument('--multi-scale', type=str, default="False", help='vary img-size +/- 50%%')
+    parser.add_argument('--single-cls', type=str, default="False", help='train as single-class dataset')
+    parser.add_argument('--adam', type=str, default="False", help='use torch.optim.Adam() optimizer')
+    parser.add_argument('--sync-bn', type=str, default="True", help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--logdir', type=str, default='runs/', help='logging directory')
     opt = parser.parse_args()
+    opt.cache_images=literal_eval(opt.cache_images)
+    opt.multi_scale=literal_eval(opt.multi_scale)
+    opt.single_cls=literal_eval(opt.single_cls)
+    opt.adam=literal_eval(opt.adam)
+    opt.sync_bn=literal_eval(opt.sync_bn)
 
     # Resume
     if opt.resume:
@@ -405,7 +428,8 @@ if __name__ == '__main__':
         if last and not opt.weights:
             print(f'Resuming training from {last}')
         opt.weights = last if opt.resume and not opt.weights else opt.weights
-    if opt.local_rank == -1 or ("RANK" in os.environ and os.environ["RANK"] == "0"):
+    if int(os.environ.get("RANK", -1)) in [-1, 0]: #opt.local_rank == -1 or ("RANK" in os.environ and os.environ["RANK"] == "0"):
+    # if int(os.environ.get("OMPI_COMM_WORLD_RANK", -1)) in [-1, 0]:
         check_git_status()
 
     opt.hyp = opt.hyp or ('data/hyp.finetune.yaml' if opt.weights else 'data/hyp.scratch.yaml')
@@ -419,13 +443,21 @@ if __name__ == '__main__':
     opt.global_rank = -1
 
     # DDP mode
-    if opt.local_rank != -1:
-        assert torch.cuda.device_count() > opt.local_rank
-        torch.cuda.set_device(opt.local_rank)
-        device = torch.device('cuda', opt.local_rank)
+    #if opt.local_rank != -1:
+    if int(os.environ.get("WORLD_SIZE", 1))>1:
+    # if int(os.environ.get("OMPI_COMM_WORLD_SIZE", 1))>1:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        print("\n\n\nThe current local rank is {}\n\n\n".format(local_rank))
+        # local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", 0))
+        assert torch.cuda.device_count() > local_rank
+        torch.cuda.set_device(local_rank)
+        device = torch.device('cuda', local_rank)
         dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
-        opt.world_size = dist.get_world_size()
-        opt.global_rank = dist.get_rank()
+        opt.world_size = int(os.environ.get("WORLD_SIZE", 1)) #dist.get_world_size()
+        # opt.world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", 1)) #dist.get_world_size()
+        opt.global_rank = int(os.environ.get("RANK", -1)) #dist.get_rank()
+        print("\n\n\nThe current rank is {}\n\n\n".format(opt.global_rank))
+        # opt.global_rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", -1))
         assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
         opt.batch_size = opt.total_batch_size // opt.world_size
 
@@ -468,7 +500,9 @@ if __name__ == '__main__':
                 'fliplr': (1, 0.0, 1.0),  # image flip left-right (probability)
                 'mixup': (1, 0.0, 1.0)}  # image mixup (probability)
 
-        assert opt.local_rank == -1, 'DDP mode not implemented for --evolve'
+        #assert opt.local_rank == -1, 'DDP mode not implemented for --evolve'
+        assert int(os.environ.get("WORLD_SIZE", 1))==1
+        # assert int(os.environ.get("OMPI_COMM_WORLD_SIZE", 1))==1 #dist.get_world_size()
         opt.notest, opt.nosave = True, True  # only test/save final epoch
         # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
         yaml_file = Path('runs/evolve/hyp_evolved.yaml')  # save best result here

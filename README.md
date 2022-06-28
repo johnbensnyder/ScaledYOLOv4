@@ -129,6 +129,16 @@ Just `Ctrl+C` to stop training and resume training by:
 python -m torch.distributed.launch --nproc_per_node 4 train.py --batch-size 64 --img 896 896 --data coco.yaml --cfg yolov4-p5.yaml --weights 'runs/exp0_yolov4-p5/weights/last.pt' --sync-bn --device 0,1,2,3 --name yolov4-p5 --resume
 ```
 
+## SageMaker
+
+This model can be trained via Amazon SageMaker. 
+
+You first need to build the Docker image in the `docker` directory. The image is based on the Nvidia PyTorch 22.05 image, with PyTorch 1.12. We add SageMaker and computer vision tools, as well as the drivers to use Amazon's elastic fabric adapter for fast distributed training. The `build_docker.sh` script will build the image, and push the result to ECR. You need to supply the script with an ECR repo, and an image tag. For example, `./build_docker my-repo pytorch-yolo-image`.
+
+Once the image is built, you can test it on your current instance using the `run_docker.sh` script. You may need to modify the `-v /home/ec2-user/SageMaker/data/:/opt/ml/input/data/` to point to your COCO data.
+
+The `Launch_SageMaker.ipynb` notebook includes instructions for launching a SageMaker training job.
+
 ## Citation
 
 ```

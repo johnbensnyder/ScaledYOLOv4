@@ -24,6 +24,9 @@ from tqdm import tqdm
 
 from utils.torch_utils import init_seeds, is_parallel
 
+import smdebug.pytorch as smd
+from smdebug.core.config_constants import DEFAULT_CONFIG_FILE_PATH
+
 # Set printoptions
 torch.set_printoptions(linewidth=320, precision=5, profile='long')
 np.set_printoptions(linewidth=320, formatter={'float_kind': '{:11.5g}'.format})  # format short g, %precision=5
@@ -438,8 +441,7 @@ class BCEBlurWithLogitsLoss(nn.Module):
         alpha_factor = 1 - torch.exp((dx - 1) / (self.alpha + 1e-4))
         loss *= alpha_factor
         return loss.mean()
-
-
+    
 def compute_loss(p, targets, model):  # predictions, targets, model
     device = targets.device
     lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
@@ -449,7 +451,13 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     # Define criteria
     BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['cls_pw']])).to(device)
     BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['obj_pw']])).to(device)
-
+    
+    # Wrap loss functions in debug hook
+    if Path(DEFAULT_CONFIG_FILE_PATH).exists() and int(os.environ.get("RANK", 0))==0:
+        hook = smd.get_hook(create_if_not_exists=True)
+        hook.register_loss(BCEcls)
+        hook.register_loss(BCEobj)
+    
     # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
     cp, cn = smooth_BCE(eps=0.0)
 
@@ -1085,7 +1093,6 @@ def output_to_target(output, width, height):
     # Convert model output to target format [batch_id, class_id, x, y, w, h, conf]
     if isinstance(output, torch.Tensor):
         output = output.cpu().numpy()
-
     targets = []
     for i, o in enumerate(output):
         if o is not None:
@@ -1098,7 +1105,13 @@ def output_to_target(output, width, height):
                 conf = pred[4]
                 cls = int(pred[5])
 
-                targets.append([i, cls, x, y, w, h, conf])
+                # targets.append([i, cls, x, y, w, h, conf])
+                # https://github.com/WongKinYiu/ScaledYOLOv4/issues/382
+                targets.append([i, cls, float(x.cpu()),   
+                                        float(y.cpu()),   
+                                        float(w.cpu()),   
+                                        float(h.cpu()),   
+                                        float(conf.cpu())])
 
     return np.array(targets)
 

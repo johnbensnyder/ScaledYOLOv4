@@ -27,12 +27,14 @@ from utils.general import (
     get_latest_run, check_git_status, check_file, increment_dir, print_mutation, plot_evolution)
 from utils.google_utils import attempt_download
 from utils.torch_utils import init_seeds, ModelEMA, select_device, intersect_dicts
+from utils.losses import YOLOLoss
 
 import smdebug.pytorch as smd
 from smdebug.core.reduction_config import ReductionConfig
 from smdebug.core.save_config import SaveConfig
 from smdebug.core.collection import CollectionKeys
 from smdebug.core.config_constants import DEFAULT_CONFIG_FILE_PATH
+from smdebug.core.modes import ModeKeys
 
 def train(hyp, opt, device, tb_writer=None):
     print(f'Hyperparameters {hyp}')
@@ -202,15 +204,29 @@ def train(hyp, opt, device, tb_writer=None):
         print('Image sizes %g train, %g test' % (imgsz, imgsz_test))
         print('Using %g dataloader workers' % dataloader.num_workers)
         print('Starting training for %g epochs...' % epochs)
-        
+    
     # wrap model in debugger
-    if Path(DEFAULT_CONFIG_FILE_PATH).exists() and int(os.environ.get("RANK", 0))==0:
+    if Path(DEFAULT_CONFIG_FILE_PATH).exists() and rank in [-1, 0]:
     # if Path(DEFAULT_CONFIG_FILE_PATH).exists() and int(os.environ.get("OMPI_COMM_WORLD_RANK", 0))==0:
         hook = smd.get_hook(create_if_not_exists=True)
+        hook.register_module(model)
+        #elif int(os.environ.get("RANK", 0))==0:
+    elif rank in [-1, 0]:
+        save_config = SaveConfig(save_interval=25)
+        include_collections = [CollectionKeys.LOSSES]
+        hook = smd.Hook(out_dir='./smdebugger',
+                        export_tensorboard=True,
+                        tensorboard_dir='./smdebugger/tensorboard',
+                        save_config=save_config,
+                        include_regex=['model.0.conv.*', 'model.31.m.2.*'],
+                        include_collections=include_collections,
+                        save_all=False,)
         hook.register_module(model)
     # torch.autograd.set_detect_anomaly(True)
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+        if rank in [-1, 0]:
+            hook.set_mode(ModeKeys.TRAIN)
 
         # Update image weights (optional)
         if dataset.image_weights:
@@ -273,6 +289,11 @@ def train(hyp, opt, device, tb_writer=None):
 
                 # Loss
                 loss, loss_items = compute_loss(pred, targets.to(device), model)  # scaled by batch_size
+                if rank in [-1, 0]:
+                    loss_tags = ['box_loss', 'object_loss', 'class_loss', 'total_loss']
+                    for tag, x in zip(loss_tags, loss_items):
+                        hook.record_tensor_value(tag, x)
+                # loss, loss_items = loss_func(pred, targets.to(device))
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 # if not torch.isfinite(loss):
@@ -316,6 +337,7 @@ def train(hyp, opt, device, tb_writer=None):
 
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
+            hook.set_mode(ModeKeys.EVAL)
             # mAP
             if ema is not None:
                 ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
@@ -335,7 +357,11 @@ def train(hyp, opt, device, tb_writer=None):
                 f.write(s + '%10.4g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
             if len(opt.name) and opt.bucket:
                 os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
-
+            tags = ['epoch_train_giou_loss', 'epoch_train_obj_loss', 'epoch_train_cls_loss',
+                        'metrics_precision', 'metrics_recall', 'metrics_mAP_0.5', 'metrics_mAP_0.5:0.95',
+                        'val_giou_loss', 'val_obj_loss', 'val_cls_loss']
+            for x, tag in zip(list(mloss[:-1]) + list(results), tags):
+                hook.record_tensor_value(tag, torch.tensor(x))
             # Tensorboard
             if tb_writer:
                 tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',

@@ -8,9 +8,11 @@ GPU_COUNT=`nvidia-smi --query-gpu=name --format=csv,noheader | wc -l`
 
 torchrun \
     --nproc_per_node=${GPU_COUNT} \
-    /opt/ml/code/train.py \
-    --batch-size 8 \
+    train.py \
+    --batch-size 16 \
     --data coco.yaml \
     --cfg yolov4-p5.yaml \
     --sync-bn True \
-    --name yolov4-p5
+    --name yolov4-p5 \
+    --adam True \
+    --multi-scale True

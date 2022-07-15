@@ -14,5 +14,5 @@ torchrun \
     --cfg yolov4-p5.yaml \
     --sync-bn True \
     --name yolov4-p5 \
-    --adam True \
+    --adam False \
     --multi-scale True

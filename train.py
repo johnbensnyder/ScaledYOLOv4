@@ -218,11 +218,12 @@ def train(hyp, opt, device, tb_writer=None):
                         export_tensorboard=True,
                         tensorboard_dir='./smdebugger/tensorboard',
                         save_config=save_config,
-                        include_regex=['model.0.conv.*', 'model.31.m.2.*'],
+                        include_regex=['model.0.conv.*', 'model.31.m.2.*', 'metrics*'],
                         include_collections=include_collections,
                         save_all=False,)
         hook.register_module(model)
     # torch.autograd.set_detect_anomaly(True)
+    
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
         if rank in [-1, 0]:
@@ -361,7 +362,7 @@ def train(hyp, opt, device, tb_writer=None):
                         'metrics_precision', 'metrics_recall', 'metrics_mAP_0.5', 'metrics_mAP_0.5:0.95',
                         'val_giou_loss', 'val_obj_loss', 'val_cls_loss']
             for x, tag in zip(list(mloss[:-1]) + list(results), tags):
-                hook.record_tensor_value(tag, torch.tensor(x))
+                hook.save_scalar(tag, torch.tensor(x))
             # Tensorboard
             if tb_writer:
                 tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
